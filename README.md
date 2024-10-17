@@ -9,7 +9,7 @@ A simple Go library for creating a job queue with Redis as its backend.
 * Uses Redis for storing and retrieving jobs
 
 ## Usage
-Create a new Queue instance and use its methods to ```Join```:
+Create a new Queue instance and use its methods:
 
 ```golang
     q, err := queue.New(ctx, &queue.Config{
