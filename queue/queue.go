@@ -82,7 +82,7 @@ type Config struct {
 	// By default, it does nothing.
 	Backup func(ctx context.Context, data []JobBackup) error
 
-	// Publisher is the function used to publish the job when dequeueing.
+	// Publisher is the function used to publish the job when dequeueing, skipping, and completing.
 	//
 	// By default, it does nothing.
 	Publisher func(ctx context.Context, job *Job) error
@@ -307,6 +307,14 @@ func (q *Queue) Done(ctx context.Context, jobID string) error {
 				return fmt.Errorf("Done(TxPipelined): %w", err)
 			}
 
+			var job Job
+			if err := tx.HGetAll(ctx, jobKey).Scan(&job); err != nil {
+				log.Printf("[ERROR] tx.HGetAll: %v", err)
+			}
+			if err := q.publisher(ctx, &job); err != nil {
+				log.Printf("[ERROR] publisher(Done): %v", err)
+			}
+
 			return nil
 		}, jobKey, inProgressKey, executionKey)
 	}
@@ -317,7 +325,10 @@ func (q *Queue) Done(ctx context.Context, jobID string) error {
 
 	log.Printf("[INFO] Job %s in this project %s has been done", jobID, q.projectID)
 
-	q.dequeue(ctx)
+	if err := q.dequeue(ctx); err != nil {
+		return fmt.Errorf("Done(dequeue): %w", err)
+	}
+
 	return nil
 }
 
@@ -547,7 +558,7 @@ func (q *Queue) dequeue(ctx context.Context) error {
 				log.Printf("[ERROR] tx.HGetAll: %v", err)
 			}
 			if err := q.publisher(ctx, &job); err != nil {
-				log.Printf("[ERROR] publisher: %v", err)
+				log.Printf("[ERROR] publisher(dequeue): %v", err)
 			}
 
 			log.Printf("[INFO] Job ID %s successfully dequeued for project %s and assigned to worker.\n", jobID, q.projectID)
@@ -615,13 +626,21 @@ func (q *Queue) processTimeout(ctx context.Context, jobID, reason string) error 
 				return fmt.Errorf("processTimeout(TxPipelined): %w", err)
 			}
 
+			var job Job
+			if err := tx.HGetAll(ctx, jobKey).Scan(&job); err != nil {
+				log.Printf("[ERROR] tx.HGetAll: %v", err)
+			}
+			if err := q.publisher(ctx, &job); err != nil {
+				log.Printf("[ERROR] publisher(processTimeout): %v", err)
+			}
+
+			log.Printf("[INFO] Job %s in this project %s has been skipped due to %s", jobID, q.projectID, reason)
+
 			return nil
 		}, jobKey, projectKey, inProgressKey)
 		if err != nil {
 			return fmt.Errorf("processTimeout(Watch): %w", err)
 		}
-
-		log.Printf("[INFO] Job %s in this project %s has been skipped due to %s", jobID, q.projectID, reason)
 
 		if err := q.dequeue(ctx); err != nil {
 			return fmt.Errorf("processTimeout(dequeue): %w", err)
