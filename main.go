@@ -44,8 +44,8 @@ func main() {
 	q, err := queue.New(ctx, &queue.Config{
 		Redis:            redisClient,
 		MaxWorker:        2,
-		AckDeadline:      60,
-		MaxExecutionTime: 3000,
+		AckDeadline:      5,
+		MaxExecutionTime: 30,
 		Secret:           []byte(getEnv("SECRET", "secret")),
 		ProjectID:        getEnv("PROJECT_ID", "LAOITDEV"),
 		BatchSize:        20,
@@ -225,8 +225,8 @@ func (h *handle) wsHandler(c echo.Context) error {
 
 			position, err := h.q.GetPosition(ctx, jobID)
 			if err != nil {
-				c.Logger().Error("Error fetching position:", err)
-				return err
+				c.Logger().Info("Error fetching position:", err)
+				// return err
 			}
 			err = ws.WriteJSON(map[string]interface{}{
 				"queue_size":      position,

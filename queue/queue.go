@@ -542,8 +542,6 @@ func (q *Queue) dequeue(ctx context.Context) error {
 				tx.Set(ctx, executionDeadlineKey, "Execution deadline", time.Duration(q.maxExecutionTime)*time.Second)
 			}
 
-			log.Printf("[INFO] Job ID %s successfully dequeued for project %s and assigned to worker.\n", jobID, q.projectID)
-
 			var job Job
 			if err := tx.HGetAll(ctx, jobKey).Scan(&job); err != nil {
 				log.Printf("[ERROR] tx.HGetAll: %v", err)
@@ -552,10 +550,11 @@ func (q *Queue) dequeue(ctx context.Context) error {
 				log.Printf("[ERROR] publisher: %v", err)
 			}
 
+			log.Printf("[INFO] Job ID %s successfully dequeued for project %s and assigned to worker.\n", jobID, q.projectID)
+
 			return nil
 		}, projectKey, inProgressKey)
 	}
-
 	return retryIf(maxRetriesFromRedisTx, time.Second, isRetryable, f)
 }
 
@@ -607,7 +606,6 @@ func (q *Queue) processTimeout(ctx context.Context, jobID, reason string) error 
 			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 				pipe.HSet(ctx, jobKey, "status", statusSkipped, "skipped_at", time.Now(), "reason", reason)
 				pipe.Decr(ctx, inProgressKey)
-				pipe.LPop(ctx, projectKey)
 				return nil
 			})
 			if err == redis.Nil {
@@ -625,7 +623,9 @@ func (q *Queue) processTimeout(ctx context.Context, jobID, reason string) error 
 
 		log.Printf("[INFO] Job %s in this project %s has been skipped due to %s", jobID, q.projectID, reason)
 
-		q.dequeue(ctx)
+		if err := q.dequeue(ctx); err != nil {
+			return fmt.Errorf("processTimeout(dequeue): %w", err)
+		}
 		return nil
 	}
 	return nil
