@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bsm/redislock"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -47,25 +48,72 @@ var ErrLockNotAcquired = errors.New("could not acquire lock")
 
 // Registry manages dynamic creation and reuse of Queue instances for different projects with distributed locking.
 type Registry struct {
-	queues     map[string]*Queue
-	locker     *redislock.Client
-	localMutex sync.RWMutex
+	instanceID  string
+	queues      map[string]*Queue
+	redisClient *redis.Client
+	locker      *redislock.Client
+	localMutex  sync.RWMutex
+
+	batchSize uint64
+	backup    func(ctx context.Context, data []JobBackup) error
+	publisher func(ctx context.Context, job *Job) error
+}
+
+// RegistryConfig is the configuration for the Registry.
+type RegistryConfig struct {
+	// BatchSize defines the maximum number of rows to process in backup mode.
+	//
+	// Set to 0 to disable backup mode.
+	//
+	// By default, there is no backup mode.
+	BatchSize uint64
+
+	// Backup is the function used to backup the queue when cleaning up.
+	//
+	// By default, it does nothing.
+	Backup func(ctx context.Context, data []JobBackup) error
+
+	// Publisher is the function used to publish the job when dequeueing, skipping, and completing.
+	//
+	// By default, it does nothing.
+	Publisher func(ctx context.Context, job *Job) error
+
+	// Redis is the Redis client used for distributed synchronization.
+	Redis *redis.Client
 }
 
 // NewRegistry returns a new Registry instance using redis for distributed synchronization.
-func NewRegistry(redis *redis.Client) (*Registry, error) {
-	locker := redislock.New(redis)
+func NewRegistry(config *RegistryConfig) (*Registry, error) {
+	if config == nil {
+		return nil, errors.New("config is nil")
+	}
+	if config.Redis == nil {
+		return nil, errors.New("redis client is nil")
+	}
+
+	locker := redislock.New(config.Redis)
+	instanceID := uuid.New().String()
+
+	log.Printf("[INFO] Registry initialized with instanceID: %s\n", instanceID)
 	return &Registry{
-		queues: make(map[string]*Queue),
-		locker: locker,
+		redisClient: config.Redis,
+		batchSize:   config.BatchSize,
+		backup:      config.Backup,
+		publisher:   config.Publisher,
+		instanceID:  instanceID,
+		queues:      make(map[string]*Queue),
+		locker:      locker,
 	}, nil
 }
 
 // GetQueue gets or creates a Queue instance for the given project ID,
 // using distributed lock to ensure that only one Queue instance is created for each project.
 func (r *Registry) GetOrCreateQueue(ctx context.Context, config *Config) (*Queue, error) {
-	if err := validateConfig(config); err != nil {
-		return nil, err
+	if config == nil {
+		return nil, errors.New("config is nil")
+	}
+	if config.ProjectID == "" {
+		return nil, errors.New("projectID is empty")
 	}
 
 	projectID := config.ProjectID
@@ -101,20 +149,66 @@ func (r *Registry) GetOrCreateQueue(ctx context.Context, config *Config) (*Queue
 		return queue, nil
 	}
 
-	newQ, err := newQueue(ctx, config)
-	if err != nil {
-		return nil, err
+	newQ := &Queue{
+		redis:            r.redisClient,
+		maxWorker:        defaultIfZero(config.MaxWorker, DefaultMaxWorker),
+		ackDeadline:      defaultIfZero(config.AckDeadline, DefaultAckDeadline),
+		maxExecutionTime: config.MaxExecutionTime,
+		projectID:        config.ProjectID,
+		batchSize:        r.batchSize,
+		backup:           r.backup,
+		publisher:        r.publisher,
 	}
+	newQ.startBackgroundTasks(ctx)
 
 	r.queues[projectID] = newQ
+	if err := r.setQueueOwner(ctx, projectID); err != nil {
+		log.Printf("[WARN] Failed to set ownership for queue: %s\n", projectID)
+	}
 
 	log.Printf("[INFO] Queue created for project: %s\n", projectID)
 	return newQ, nil
 }
 
-type Config struct {
-	Redis *redis.Client
+func (r *Registry) getQueueOwner(ctx context.Context, projectID string) (string, error) {
+	return r.redisClient.Get(ctx, "queue_owner:"+projectID).Result()
+}
 
+func (r *Registry) setQueueOwner(ctx context.Context, projectID string) error {
+	return r.redisClient.Set(ctx, "queue_owner:"+projectID, r.instanceID, 0).Err()
+}
+
+func (r *Registry) releaseQueueOwner(ctx context.Context, projectID string) error {
+	return r.redisClient.Del(ctx, "queue_owner:"+projectID).Err()
+}
+
+// Close cleans up all queues in the registry.
+func (r *Registry) Close(ctx context.Context) {
+	r.localMutex.Lock()
+	defer r.localMutex.Unlock()
+
+	log.Println("[INFO] Starting registry shutdown...")
+	for projectID, queue := range r.queues {
+		owner, err := r.getQueueOwner(ctx, projectID)
+		if err != nil {
+			log.Printf("[WARN] Failed to retrieve owner for queue: %s\n", projectID)
+			continue
+		}
+
+		if owner != r.instanceID {
+			log.Printf("[INFO] Skipping queue %s as it is owned by another instance: %s\n", projectID, owner)
+			continue
+		}
+
+		queue.cleanup(ctx)
+		delete(r.queues, projectID)
+		r.releaseQueueOwner(ctx, projectID)
+	}
+
+	log.Println("[INFO] All queues cleaned up and registry closed.")
+}
+
+type Config struct {
 	// ProjectID is the ID of the project that the queue belongs to.
 	ProjectID string
 
@@ -139,65 +233,6 @@ type Config struct {
 	//
 	// By default, there is no time limit.
 	MaxExecutionTime uint64
-
-	// BatchSize defines the maximum number of rows to process in backup mode.
-	//
-	// Set to 0 to disable backup mode.
-	//
-	// By default, there is no backup mode.
-	BatchSize uint64
-
-	// The secret used to make the signature of the message.
-	Secret []byte
-
-	// Backup is the function used to backup the queue when cleaning up.
-	//
-	// By default, it does nothing.
-	Backup func(ctx context.Context, data []JobBackup) error
-
-	// Publisher is the function used to publish the job when dequeueing, skipping, and completing.
-	//
-	// By default, it does nothing.
-	Publisher func(ctx context.Context, job *Job) error
-}
-
-// New returns a new Queue instance with the given configuration.
-func newQueue(ctx context.Context, config *Config) (*Queue, error) {
-	if err := validateConfig(config); err != nil {
-		return nil, err
-	}
-
-	q := &Queue{
-		redis:            config.Redis,
-		maxWorker:        defaultIfZero(config.MaxWorker, DefaultMaxWorker),
-		ackDeadline:      defaultIfZero(config.AckDeadline, DefaultAckDeadline),
-		maxExecutionTime: config.MaxExecutionTime,
-		secret:           config.Secret,
-		projectID:        config.ProjectID,
-		batchSize:        config.BatchSize,
-		backup:           config.Backup,
-		publisher:        config.Publisher,
-	}
-
-	q.startBackgroundTasks(ctx)
-	return q, nil
-}
-
-func validateConfig(config *Config) error {
-	if config == nil {
-		return errors.New("config is nil")
-	}
-	if config.Redis == nil {
-		return errors.New("redis is nil")
-	}
-	if config.Secret == nil {
-		return errors.New("secret is nil")
-	}
-	if config.ProjectID == "" {
-		return errors.New("project id is empty")
-	}
-
-	return nil
 }
 
 func defaultIfZero(value, defaultValue uint64) uint64 {
@@ -209,7 +244,6 @@ func defaultIfZero(value, defaultValue uint64) uint64 {
 
 type Queue struct {
 	redis            *redis.Client
-	secret           []byte
 	projectID        string
 	maxWorker        uint64
 	maxExecutionTime uint64
@@ -481,7 +515,7 @@ type JobBackup struct {
 	Reason    string     `redis:"reason"`
 }
 
-func (q *Queue) Cleanup(ctx context.Context) error {
+func (q *Queue) cleanup(ctx context.Context) error {
 	inProgressKey := fmt.Sprintf(redisInProgressKeyFormat, q.projectID)
 	queueKey := fmt.Sprintf(redisQueueKeyFormat, q.projectID)
 	queueNumberKey := fmt.Sprintf(redisQueueNumberKeyFormat, q.projectID)
