@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"sync"
 	"text/template"
 	"time"
@@ -41,19 +42,9 @@ func main() {
 	}
 	defer redisClient.Close()
 
-	registry, err := queue.NewRegistry(redisClient)
-	if err != nil {
-		log.Fatalf("queue.NewRegistry: %v", err)
-	}
-
-	q, err := registry.GetOrCreateQueue(ctx, &queue.Config{
-		Redis:            redisClient,
-		MaxWorker:        2,
-		AckDeadline:      5,
-		MaxExecutionTime: 30,
-		Secret:           []byte(getEnv("SECRET", "secret")),
-		ProjectID:        getEnv("PROJECT_ID", "LAOITDEV"),
-		BatchSize:        20,
+	registry, err := queue.NewRegistry(&queue.RegistryConfig{
+		Redis:     redisClient,
+		BatchSize: 20,
 		Backup: func(ctx context.Context, data []queue.JobBackup) error {
 			d, _ := json.Marshal(data)
 			log.Printf("[INFO] Backup: %s", d)
@@ -66,11 +57,18 @@ func main() {
 		},
 	})
 	if err != nil {
-		log.Fatalf("registry.GetOrCreateQueue: %v", err)
+		log.Fatalf("queue.NewRegistry: %v", err)
 	}
+	defer registry.Close(ctx)
 
-	if err := q.Cleanup(ctx); err != nil {
-		log.Fatalf("q.Cleanup: %v", err)
+	q, err := registry.GetOrCreateQueue(ctx, &queue.Config{
+		MaxWorker:        2,
+		AckDeadline:      5,
+		MaxExecutionTime: 30,
+		ProjectID:        getEnv("PROJECT_ID", "LAOITDEV"),
+	})
+	if err != nil {
+		log.Fatalf("registry.GetOrCreateQueue: %v", err)
 	}
 
 	h := &handle{
@@ -92,7 +90,26 @@ func main() {
 
 	e.HideBanner = true
 
-	log.Fatal(e.Start(fmt.Sprintf(":%s", getEnv("PORT", "3300"))))
+	errCh := make(chan error, 1)
+	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, os.Kill)
+	defer cancel()
+
+	go func() {
+		errCh <- e.Start(fmt.Sprintf(":%s", getEnv("PORT", "3300")))
+	}()
+
+	select {
+	case <-ctx.Done():
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := e.Shutdown(ctx); err != nil {
+			log.Fatalf("shutdown server failure: %v", err)
+		}
+		log.Println("server shutdown")
+
+	case err := <-errCh:
+		log.Fatalf("start server error +: %v", err)
+	}
 }
 
 type TemplateRenderer struct {

@@ -12,19 +12,9 @@ A simple Go library for creating a job queue with Redis as its backend.
 Create a new Queue instance and use its methods:
 
 ```golang
-    registry, err := queue.NewRegistry(redisClient)
-    if err != nil {
-      log.Fatalf("queue.NewRegistry: %v", err)
-    }
-
-    q, err := registry.GetOrCreateQueue(ctx, &queue.Config{
-      Redis:            redisClient,
-      MaxWorker:        2,
-      AckDeadline:      5,
-      MaxExecutionTime: 30,
-      Secret:           []byte(getEnv("SECRET", "secret")),
-      ProjectID:        getEnv("PROJECT_ID", "LAOITDEV"),
-      BatchSize:        20,
+    registry, err := queue.NewRegistry(&queue.RegistryConfig{
+      Redis:     redisClient,
+      BatchSize: 20,
       Backup: func(ctx context.Context, data []queue.JobBackup) error {
         d, _ := json.Marshal(data)
         log.Printf("[INFO] Backup: %s", d)
@@ -35,6 +25,17 @@ Create a new Queue instance and use its methods:
         log.Printf("[INFO] PublishJob: %s", d)
         return nil
       },
+    })
+    if err != nil {
+      log.Fatalf("queue.NewRegistry: %v", err)
+    }
+    defer registry.Close(ctx)
+
+    q, err := registry.GetOrCreateQueue(ctx, &queue.Config{
+      MaxWorker:        2,
+      AckDeadline:      5,
+      MaxExecutionTime: 30,
+      ProjectID:        getEnv("PROJECT_ID", "LAOITDEV"),
     })
     if err != nil {
       log.Fatalf("registry.GetOrCreateQueue: %v", err)
