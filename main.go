@@ -41,7 +41,12 @@ func main() {
 	}
 	defer redisClient.Close()
 
-	q, err := queue.New(ctx, &queue.Config{
+	registry, err := queue.NewRegistry(redisClient)
+	if err != nil {
+		log.Fatalf("queue.NewRegistry: %v", err)
+	}
+
+	q, err := registry.GetOrCreateQueue(ctx, &queue.Config{
 		Redis:            redisClient,
 		MaxWorker:        2,
 		AckDeadline:      5,
@@ -61,7 +66,7 @@ func main() {
 		},
 	})
 	if err != nil {
-		log.Fatalf("queue.NewWithDefault: %v", err)
+		log.Fatalf("registry.GetOrCreateQueue: %v", err)
 	}
 
 	if err := q.Cleanup(ctx); err != nil {

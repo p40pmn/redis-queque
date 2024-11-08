@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/bsm/redislock"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -37,7 +39,78 @@ const (
 	maxRetriesFromRedisTx = 3
 )
 
+// ErrJobNotInQueue indicates that the job is not in the queue.
 var ErrJobNotInQueue = errors.New("job not in queue")
+
+// ErrLockNotAcquired indicates that another instance is already acquiring the lock.
+var ErrLockNotAcquired = errors.New("could not acquire lock")
+
+// Registry manages dynamic creation and reuse of Queue instances for different projects with distributed locking.
+type Registry struct {
+	queues     map[string]*Queue
+	locker     *redislock.Client
+	localMutex sync.RWMutex
+}
+
+// NewRegistry returns a new Registry instance using redis for distributed synchronization.
+func NewRegistry(redis *redis.Client) (*Registry, error) {
+	locker := redislock.New(redis)
+	return &Registry{
+		queues: make(map[string]*Queue),
+		locker: locker,
+	}, nil
+}
+
+// GetQueue gets or creates a Queue instance for the given project ID,
+// using distributed lock to ensure that only one Queue instance is created for each project.
+func (r *Registry) GetOrCreateQueue(ctx context.Context, config *Config) (*Queue, error) {
+	if err := validateConfig(config); err != nil {
+		return nil, err
+	}
+
+	projectID := config.ProjectID
+	queueLockKey := fmt.Sprintf("queue_lock:%s", projectID)
+
+	r.localMutex.RLock()
+	q, exists := r.queues[projectID]
+	r.localMutex.RUnlock()
+	if exists {
+		return q, nil
+	}
+
+	lock, err := r.locker.Obtain(ctx, queueLockKey, time.Second*5, nil)
+	if errors.Is(err, redislock.ErrNotObtained) {
+		log.Printf("[INFO] Another instance is initializing queue for project: %s\n", projectID)
+		return nil, ErrLockNotAcquired
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := lock.Release(ctx); err != nil {
+			log.Printf("[WARN] Failed to release the lock for project: %s\n", projectID)
+		}
+	}()
+
+	r.localMutex.Lock()
+	defer r.localMutex.Unlock()
+
+	queue, exits := r.queues[projectID]
+	if exits {
+		log.Printf("[INFO] Queue already created by another instance during lock for project: %s\n", projectID)
+		return queue, nil
+	}
+
+	newQ, err := newQueue(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+
+	r.queues[projectID] = newQ
+
+	log.Printf("[INFO] Queue created for project: %s\n", projectID)
+	return newQ, nil
+}
 
 type Config struct {
 	Redis *redis.Client
@@ -89,28 +162,16 @@ type Config struct {
 }
 
 // New returns a new Queue instance with the given configuration.
-func New(ctx context.Context, config *Config) (*Queue, error) {
-	if config == nil {
-		return nil, errors.New("config is nil")
-	}
-	if config.Redis == nil {
-		return nil, errors.New("redis is nil")
-	}
-	if config.Secret == nil {
-		return nil, errors.New("secret is nil")
-	}
-	if config.MaxWorker == 0 {
-		config.MaxWorker = DefaultMaxWorker
-	}
-	if config.AckDeadline == 0 {
-		config.AckDeadline = DefaultAckDeadline
+func newQueue(ctx context.Context, config *Config) (*Queue, error) {
+	if err := validateConfig(config); err != nil {
+		return nil, err
 	}
 
 	q := &Queue{
 		redis:            config.Redis,
-		maxWorker:        config.MaxWorker,
+		maxWorker:        defaultIfZero(config.MaxWorker, DefaultMaxWorker),
+		ackDeadline:      defaultIfZero(config.AckDeadline, DefaultAckDeadline),
 		maxExecutionTime: config.MaxExecutionTime,
-		ackDeadline:      config.AckDeadline,
 		secret:           config.Secret,
 		projectID:        config.ProjectID,
 		batchSize:        config.BatchSize,
@@ -118,32 +179,32 @@ func New(ctx context.Context, config *Config) (*Queue, error) {
 		publisher:        config.Publisher,
 	}
 
-	go func() {
-		log.Println("[INFO] Starting task notifications subscriber from redis expiration events for project: ", q.projectID)
-		q.subscribeToKeySpaceNotifications(ctx)
-	}()
-
-	go func() {
-		log.Println("[INFO] Starting job queue monitor for project: ", q.projectID)
-		q.monitorQueueAndDequeue(ctx)
-	}()
-
+	q.startBackgroundTasks(ctx)
 	return q, nil
 }
 
-// NewWithDefault returns a new Queue instance with default config.
-func NewWithDefault(ctx context.Context, redis *redis.Client, projectID string, secret []byte) (*Queue, error) {
-	return New(ctx, &Config{
-		Redis:            redis,
-		MaxWorker:        DefaultMaxWorker,
-		AckDeadline:      DefaultAckDeadline,
-		MaxExecutionTime: DefaultMaxExecutionTime,
-		Secret:           secret,
-		ProjectID:        projectID,
-		Backup:           func(ctx context.Context, data []JobBackup) error { return nil },
-		Publisher:        func(ctx context.Context, job *Job) error { return nil },
-		BatchSize:        0,
-	})
+func validateConfig(config *Config) error {
+	if config == nil {
+		return errors.New("config is nil")
+	}
+	if config.Redis == nil {
+		return errors.New("redis is nil")
+	}
+	if config.Secret == nil {
+		return errors.New("secret is nil")
+	}
+	if config.ProjectID == "" {
+		return errors.New("project id is empty")
+	}
+
+	return nil
+}
+
+func defaultIfZero(value, defaultValue uint64) uint64 {
+	if value == 0 {
+		return defaultValue
+	}
+	return value
 }
 
 type Queue struct {
@@ -156,6 +217,18 @@ type Queue struct {
 	batchSize        uint64
 	backup           func(ctx context.Context, data []JobBackup) error
 	publisher        func(ctx context.Context, job *Job) error
+}
+
+func (q *Queue) startBackgroundTasks(ctx context.Context) {
+	go func() {
+		log.Println("[INFO] Starting task notifications subscriber from redis expiration events for project: ", q.projectID)
+		q.subscribeToKeySpaceNotifications(ctx)
+	}()
+
+	go func() {
+		log.Println("[INFO] Starting job queue monitor for project: ", q.projectID)
+		q.monitorQueueAndDequeue(ctx)
+	}()
 }
 
 func (q *Queue) GetMaxWorker() uint64 {

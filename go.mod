@@ -2,7 +2,10 @@ module github.com/p40pmn/redis-queue
 
 go 1.23.1
 
-require github.com/redis/go-redis/v9 v9.6.1
+require (
+	github.com/bsm/redislock v0.9.4
+	github.com/redis/go-redis/v9 v9.6.1
+)
 
 require (
 	github.com/labstack/gommon v0.4.2 // indirect
