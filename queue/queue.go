@@ -46,6 +46,21 @@ var ErrJobNotInQueue = errors.New("job not in queue")
 // ErrLockNotAcquired indicates that another instance is already acquiring the lock.
 var ErrLockNotAcquired = errors.New("could not acquire lock")
 
+// ErrJobAlreadyProcessing indicates that the job is already being processed.
+var ErrJobAlreadyProcessing = errors.New("job is already being processed")
+
+// ErrJobAlreadyCompleted indicates that the job is already completed.
+var ErrJobAlreadyCompleted = errors.New("job is already completed")
+
+// ErrJobAlreadyAssigned indicates that the job is already assigned.
+var ErrJobAlreadyAssigned = errors.New("job is already assigned")
+
+// ErrJobNotFound indicates that the job is not found.
+var ErrJobNotFound = errors.New("job not found")
+
+// ErrJobAlreadyExistsOrSkipped indicates that the job is already exists or skipped.
+var ErrJobAlreadyExistsOrSkipped = errors.New("job is already exists or skipped")
+
 // Registry manages dynamic creation and reuse of Queue instances for different projects with distributed locking.
 type Registry struct {
 	instanceID  string
@@ -350,16 +365,16 @@ func (q *Queue) Ack(ctx context.Context, jobID string) error {
 		return q.redis.Watch(ctx, func(tx *redis.Tx) error {
 			status, err := tx.HGet(ctx, jobKey, "status").Result()
 			if err == redis.Nil {
-				return fmt.Errorf("Job %s in this project %s does not exist", jobID, q.projectID)
+				return fmt.Errorf("Job %s in this project %s does not exist: %w", jobID, q.projectID, ErrJobNotFound)
 			}
 			if err != nil {
 				return err
 			}
 			if status == statusProcessing {
-				return fmt.Errorf("Job %s in this project %s has already been processed", jobID, q.projectID)
+				return fmt.Errorf("Job %s in this project %s has already been processed: %w", jobID, q.projectID, ErrJobAlreadyProcessing)
 			}
 			if status != statusAssigned {
-				return fmt.Errorf("Job %s in this project %s is not currently being assigned", jobID, q.projectID)
+				return fmt.Errorf("Job %s in this project %s is not currently being assigned: %w", jobID, q.projectID, ErrJobAlreadyAssigned)
 			}
 
 			_, err = tx.Pipelined(ctx, func(pipe redis.Pipeliner) error {
@@ -391,16 +406,16 @@ func (q *Queue) Done(ctx context.Context, jobID string) error {
 		return q.redis.Watch(ctx, func(tx *redis.Tx) error {
 			status, err := tx.HGet(ctx, jobKey, "status").Result()
 			if err == redis.Nil {
-				return fmt.Errorf("Job %s in this project %s does not exist", jobID, q.projectID)
+				return fmt.Errorf("Job %s in this project %s does not exist: %w", jobID, q.projectID, ErrJobNotFound)
 			}
 			if err != nil {
 				return fmt.Errorf("Failed to get the job: %v", err)
 			}
 			if status == statusCompleted {
-				return fmt.Errorf("Job %s in this project %s has already been completed", jobID, q.projectID)
+				return fmt.Errorf("Job %s in this project %s has already been completed: %w", jobID, q.projectID, ErrJobAlreadyCompleted)
 			}
 			if status != statusProcessing {
-				return fmt.Errorf("Job %s in this project %s is not currently being processed", jobID, q.projectID)
+				return fmt.Errorf("Job %s in this project %s is not currently being processed: %w", jobID, q.projectID, ErrJobAlreadyProcessing)
 			}
 
 			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
@@ -460,7 +475,7 @@ func (q *Queue) Join(ctx context.Context, jobID string) (*Job, error) {
 				return err
 			}
 			if exists > 0 {
-				return fmt.Errorf("Job %s already exists in this project %s (or may it has been processed or skipped)", q.projectID, jobID)
+				return fmt.Errorf("Job %s already exists in this project %s (or may it has been processed or skipped): %w", q.projectID, jobID, ErrJobAlreadyExistsOrSkipped)
 			}
 
 			cmds, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
